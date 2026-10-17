@@ -2,16 +2,16 @@
 """
 Моніторинг вільних квитків Wisła Kraków (bilety.wislakrakow.com) -> Telegram.
  
-Список матчів береться з events.json. Для кожного матчу скрипт запитує
-GetWGLSectorsInfo: порожній масив "sectors" = квитків немає, непорожній = є.
+Сторінка події відкривається у справжньому (headless) браузері Chromium через Playwright:
+сайт сам виконує свій JavaScript і сам робить запити до API. Ми лише читаємо відповідь
+GetWGLSectorsInfo, яку отримала сторінка. Жодних підроблених токенів чи заголовків.
  
-Лише стандартна бібліотека Python. Секрети - тільки зі змінних оточення.
+Список матчів - events.json. Порожній масив "sectors" = квитків немає.
+Секрети беруться ТІЛЬКИ зі змінних оточення.
 """
 import hashlib
-import http.cookiejar
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -19,20 +19,19 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
  
 BASE = "https://bilety.wislakrakow.com"
 EVENTS_FILE = Path("events.json")
 STATE_FILE = Path("state/state.json")
  
+NAV_TIMEOUT_MS = 45_000
+API_WAIT_SEC = 30
+ 
 REMIND_EVERY_SEC = 30 * 60        # повторне нагадування, поки квитки доступні
 HEARTBEAT_EVERY_SEC = 24 * 3600   # "я живий" раз на добу (без звуку)
 FAIL_ALERT_AFTER = 3              # збоїв поспіль до сповіщення про проблему
 FAIL_REALERT_EVERY_SEC = 6 * 3600
- 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
  
  
 def load_state():
@@ -58,64 +57,6 @@ def load_events():
     return events
  
  
-def fetch(opener, url, referer=None, as_json=True, post=False):
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": (
-            "application/json, text/plain, */*" if as_json
-            else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        ),
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-    }
-    if referer:
-        headers["Referer"] = referer
-        headers["X-Requested-With"] = "XMLHttpRequest"
-        headers["Sec-Fetch-Dest"] = "empty"
-        headers["Sec-Fetch-Mode"] = "cors"
-        headers["Sec-Fetch-Site"] = "same-origin"
-        if post:
-            headers["Origin"] = BASE
-    else:
-        headers["Sec-Fetch-Dest"] = "document"
-        headers["Sec-Fetch-Mode"] = "navigate"
-        headers["Sec-Fetch-Site"] = "none"
-        headers["Upgrade-Insecure-Requests"] = "1"
-    last_err = None
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(
-                url, data=b"" if post else None, headers=headers,
-                method="POST" if post else "GET",
-            )
-            with opener.open(req, timeout=20) as resp:
-                raw = resp.read(5_000_000)
-                status = resp.status
-                ctype = resp.headers.get("Content-Type", "")
-                hdrs = {
-                    k: resp.headers.get(k)
-                    for k in ("Server", "Content-Length", "Content-Encoding",
-                              "Cache-Control", "CF-RAY", "X-Powered-By", "Via")
-                    if resp.headers.get(k)
-                }
-            body = raw.decode("utf-8-sig", "replace")  # utf-8-sig прибирає можливий BOM
-            if not as_json:
-                return body
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError:
-                snippet = " ".join(body.split())[:200]
-                last_err = f"не JSON (HTTP {status}, {ctype}, {len(raw)} байт, {hdrs}): {snippet!r}"
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403, 429):
-                raise RuntimeError(f"HTTP {e.code} (можливе блокування)") from None
-            last_err = f"HTTP {e.code}"
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last_err = type(e).__name__
-        time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"запит не вдався: {last_err}")
- 
- 
 def send_telegram(token, chat_id, text, silent=False):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({
@@ -133,6 +74,71 @@ def send_telegram(token, chat_id, text, silent=False):
     except Exception as e:  # без деталей, щоб не світити URL з токеном
         print(f"Telegram: помилка {type(e).__name__}")
     return False
+ 
+ 
+def parse_json_body(text, what):
+    text = (text or "").lstrip("\ufeff")
+    if not text.strip():
+        raise RuntimeError(f"{what}: порожня відповідь")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        snippet = " ".join(text.split())[:200]
+        raise RuntimeError(f"{what}: відповідь не є JSON: {snippet!r}") from None
+ 
+ 
+def load_event_data(browser, page_url):
+    """Відкриває сторінку події як звичайний браузер.
+    Повертає (info, names): відповідь GetWGLSectorsInfo і {id сектора: назва}."""
+    ctx = browser.new_context(
+        locale="pl-PL",
+        timezone_id="Europe/Warsaw",
+        viewport={"width": 1366, "height": 900},
+    )
+    try:
+        page = ctx.new_page()
+        # Не вантажимо картинки/шрифти/медіа: швидше і менше навантаження на сайт
+        page.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("image", "media", "font")
+            else route.continue_(),
+        )
+        seen = {}
+ 
+        def on_response(resp):
+            name = urlparse(resp.url).path.rsplit("/", 1)[-1]
+            if name in ("GetWGLSectorsInfo", "GetWGLSectors"):
+                seen[name] = resp
+ 
+        page.on("response", on_response)
+        page.goto(page_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+ 
+        deadline = time.time() + API_WAIT_SEC
+        while "GetWGLSectorsInfo" not in seen and time.time() < deadline:
+            page.wait_for_timeout(500)
+        resp = seen.get("GetWGLSectorsInfo")
+        if resp is None:
+            raise RuntimeError(
+                "сторінка не зробила запит GetWGLSectorsInfo (змінилась структура сайту або захист?)"
+            )
+        page.wait_for_timeout(1500)  # дати час на GetWGLSectors (назви секторів)
+ 
+        if resp.status != 200:
+            raise RuntimeError(f"GetWGLSectorsInfo: HTTP {resp.status}")
+        info = parse_json_body(resp.text(), "GetWGLSectorsInfo")
+ 
+        names = {}
+        sec = seen.get("GetWGLSectors")
+        if sec is not None and sec.status == 200:
+            try:
+                data = parse_json_body(sec.text(), "GetWGLSectors")
+                names = {s.get("id"): s.get("name") for s in data.get("sectors", [])}
+            except Exception:
+                names = {}
+        return info, names
+    finally:
+        ctx.close()
  
  
 def sector_labels(sectors, names):
@@ -163,40 +169,26 @@ def free_count(item):
     return None
  
  
-def check_event(ev, st, token, chat_id, now):
+def check_event(ev, st, token, chat_id, now, browser):
     """Перевіряє одну подію. Повертає 'free' | 'none' | 'error'."""
     eid = ev["id"]
     page_url = f"{BASE}/Stadium/Index?eventId={eid}"
-    info_url = f"{BASE}/Stadium/GetWGLSectorsInfo?eventId={eid}"
-    sectors_url = f"{BASE}/Stadium/GetWGLSectors?eventId={eid}"
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
  
     try:
-        try:
-            page = fetch(opener, page_url, as_json=False)  # cookies, як у браузера
-            print(f"[{eid}] сторінка: {len(page)} символів; cookies: {[c.name for c in jar]}")
-            if os.environ.get("DEBUG_PAGE", "1") == "1":
-                for key in ("X-Color-Id", "X-Theme-Id"):
-                    i = page.find(key)
-                    print(f"[{eid}] '{key}' на сторінці:",
-                          " ".join(page[max(0, i - 80): i + 160].split()) if i >= 0 else "не знайдено")
-                srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)', page)
-                print(f"[{eid}] скрипти: {srcs[:12]}")
-        except Exception as e:
-            print(f"[{eid}] сторінка події (cookies): {e}")
-        info = fetch(opener, info_url, referer=page_url, post=True)
+        info, names = load_event_data(browser, page_url)
         sectors = info.get("sectors") if isinstance(info, dict) else None
         if not isinstance(sectors, list):
             raise RuntimeError("неочікуваний формат відповіді (немає масиву 'sectors')")
     except Exception as e:
         fails = int(st.get("fail_count", 0)) + 1
         st["fail_count"] = fails
-        print(f"[{eid}] збій #{fails}: {e}")
+        msg = f"{type(e).__name__}: {e}" if not isinstance(e, RuntimeError) else str(e)
+        msg = " ".join(msg.split())[:300]
+        print(f"[{eid}] збій #{fails}: {msg}")
         if fails >= FAIL_ALERT_AFTER and now - float(st.get("last_fail_alert", 0)) > FAIL_REALERT_EVERY_SEC:
             if send_telegram(
                 token, chat_id,
-                f"⚠️ {ev['name']}: проблема з моніторингом ({fails} збоїв поспіль): {e}\n{page_url}",
+                f"⚠️ {ev['name']}: проблема з моніторингом ({fails} збоїв поспіль): {msg}\n{page_url}",
             ):
                 st["last_fail_alert"] = now
         return "error"
@@ -219,11 +211,6 @@ def check_event(ev, st, token, chat_id, now):
         st["last_sig"] = ""  # щоб наступна поява квитків знову дала сповіщення
         return "none"
  
-    try:
-        names_raw = fetch(opener, sectors_url, referer=page_url, post=True)
-        names = {s.get("id"): s.get("name") for s in names_raw.get("sectors", [])}
-    except Exception:
-        names = {}
     labels = sector_labels(sectors, names)
     sig = hashlib.sha1("|".join(sorted(labels)).encode()).hexdigest()
     changed = sig != st.get("last_sig")
@@ -273,13 +260,20 @@ def main():
         print("Немає активних подій для моніторингу.")
         return 0
  
+    from playwright.sync_api import sync_playwright
+ 
     state = load_state()
     ev_state = state.setdefault("events", {})
     results = {}
-    for ev in events:
-        st = ev_state.setdefault(ev["id"], {})
-        results[ev["id"]] = check_event(ev, st, token, chat_id, now)
-        time.sleep(1)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            for ev in events:
+                st = ev_state.setdefault(ev["id"], {})
+                results[ev["id"]] = check_event(ev, st, token, chat_id, now, browser)
+                time.sleep(1)
+        finally:
+            browser.close()
  
     # Щодобове "я живий": лише якщо всі перевірки пройшли без помилок і квитків ще немає
     all_ok = all(r != "error" for r in results.values())
