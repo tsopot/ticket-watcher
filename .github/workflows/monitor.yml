@@ -1,0 +1,46 @@
+name: Ticket monitor
+ 
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Надіслати тестове повідомлення в Telegram"
+        type: boolean
+        default: false
+      event_id:
+        description: "Разова перевірка іншого eventId (порожньо = усі матчі з events.json)"
+        type: string
+        default: ""
+ 
+permissions:
+  contents: read
+ 
+concurrency:
+  group: ticket-monitor
+  cancel-in-progress: false
+ 
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+ 
+      # Зберігає state між запусками (щоб не спамити однаковими сповіщеннями)
+      - uses: actions/cache@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: |
+            state-
+ 
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_MODE: ${{ inputs.test && '1' || '0' }}
+          EVENT_ID: ${{ inputs.event_id }}
+        run: python3 monitor.py
+ 
