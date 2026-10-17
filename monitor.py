@@ -71,16 +71,23 @@ def fetch(opener, url, referer=None, as_json=True):
         try:
             req = urllib.request.Request(url, headers=headers)
             with opener.open(req, timeout=20) as resp:
-                body = resp.read(5_000_000).decode("utf-8", "replace")
-            return json.loads(body) if as_json else body
+                raw = resp.read(5_000_000)
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "")
+            body = raw.decode("utf-8-sig", "replace")  # utf-8-sig прибирає можливий BOM
+            if not as_json:
+                return body
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                snippet = " ".join(body.split())[:200]
+                last_err = f"не JSON (HTTP {status}, {ctype}): {snippet!r}"
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 429):
                 raise RuntimeError(f"HTTP {e.code} (можливе блокування)") from None
             last_err = f"HTTP {e.code}"
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_err = type(e).__name__
-        except json.JSONDecodeError:
-            last_err = "відповідь не є JSON (можливо, сторінка-заглушка/захист)"
         time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"запит не вдався: {last_err}")
  
@@ -145,8 +152,8 @@ def check_event(ev, st, token, chat_id, now):
     try:
         try:
             fetch(opener, page_url, as_json=False)  # cookies, як у браузера
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[{eid}] сторінка події (cookies): {e}")
         info = fetch(opener, info_url, referer=page_url)
         sectors = info.get("sectors") if isinstance(info, dict) else None
         if not isinstance(sectors, list):
