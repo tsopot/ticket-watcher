@@ -11,6 +11,7 @@ import hashlib
 import http.cookiejar
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -57,11 +58,11 @@ def load_events():
     return events
  
  
-def fetch(opener, url, referer=None, as_json=True):
+def fetch(opener, url, referer=None, as_json=True, post=False):
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": (
-            "application/json, text/javascript, */*; q=0.01" if as_json
+            "application/json, text/plain, */*" if as_json
             else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         ),
         "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -73,6 +74,8 @@ def fetch(opener, url, referer=None, as_json=True):
         headers["Sec-Fetch-Dest"] = "empty"
         headers["Sec-Fetch-Mode"] = "cors"
         headers["Sec-Fetch-Site"] = "same-origin"
+        if post:
+            headers["Origin"] = BASE
     else:
         headers["Sec-Fetch-Dest"] = "document"
         headers["Sec-Fetch-Mode"] = "navigate"
@@ -81,7 +84,10 @@ def fetch(opener, url, referer=None, as_json=True):
     last_err = None
     for attempt in range(3):
         try:
-            req = urllib.request.Request(url, headers=headers)
+            req = urllib.request.Request(
+                url, data=b"" if post else None, headers=headers,
+                method="POST" if post else "GET",
+            )
             with opener.open(req, timeout=20) as resp:
                 raw = resp.read(5_000_000)
                 status = resp.status
@@ -170,9 +176,16 @@ def check_event(ev, st, token, chat_id, now):
         try:
             page = fetch(opener, page_url, as_json=False)  # cookies, як у браузера
             print(f"[{eid}] сторінка: {len(page)} символів; cookies: {[c.name for c in jar]}")
+            if os.environ.get("DEBUG_PAGE", "1") == "1":
+                for key in ("X-Color-Id", "X-Theme-Id"):
+                    i = page.find(key)
+                    print(f"[{eid}] '{key}' на сторінці:",
+                          " ".join(page[max(0, i - 80): i + 160].split()) if i >= 0 else "не знайдено")
+                srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)', page)
+                print(f"[{eid}] скрипти: {srcs[:12]}")
         except Exception as e:
             print(f"[{eid}] сторінка події (cookies): {e}")
-        info = fetch(opener, info_url, referer=page_url)
+        info = fetch(opener, info_url, referer=page_url, post=True)
         sectors = info.get("sectors") if isinstance(info, dict) else None
         if not isinstance(sectors, list):
             raise RuntimeError("неочікуваний формат відповіді (немає масиву 'sectors')")
@@ -207,7 +220,7 @@ def check_event(ev, st, token, chat_id, now):
         return "none"
  
     try:
-        names_raw = fetch(opener, sectors_url, referer=page_url)
+        names_raw = fetch(opener, sectors_url, referer=page_url, post=True)
         names = {s.get("id"): s.get("name") for s in names_raw.get("sectors", [])}
     except Exception:
         names = {}
