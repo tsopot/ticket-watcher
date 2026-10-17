@@ -60,12 +60,24 @@ def load_events():
 def fetch(opener, url, referer=None, as_json=True):
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/plain, */*" if as_json else "text/html,*/*",
-        "Accept-Language": "pl,en;q=0.8",
+        "Accept": (
+            "application/json, text/javascript, */*; q=0.01" if as_json
+            else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
     }
     if referer:
         headers["Referer"] = referer
         headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["Sec-Fetch-Dest"] = "empty"
+        headers["Sec-Fetch-Mode"] = "cors"
+        headers["Sec-Fetch-Site"] = "same-origin"
+    else:
+        headers["Sec-Fetch-Dest"] = "document"
+        headers["Sec-Fetch-Mode"] = "navigate"
+        headers["Sec-Fetch-Site"] = "none"
+        headers["Upgrade-Insecure-Requests"] = "1"
     last_err = None
     for attempt in range(3):
         try:
@@ -74,6 +86,12 @@ def fetch(opener, url, referer=None, as_json=True):
                 raw = resp.read(5_000_000)
                 status = resp.status
                 ctype = resp.headers.get("Content-Type", "")
+                hdrs = {
+                    k: resp.headers.get(k)
+                    for k in ("Server", "Content-Length", "Content-Encoding",
+                              "Cache-Control", "CF-RAY", "X-Powered-By", "Via")
+                    if resp.headers.get(k)
+                }
             body = raw.decode("utf-8-sig", "replace")  # utf-8-sig прибирає можливий BOM
             if not as_json:
                 return body
@@ -81,7 +99,7 @@ def fetch(opener, url, referer=None, as_json=True):
                 return json.loads(body)
             except json.JSONDecodeError:
                 snippet = " ".join(body.split())[:200]
-                last_err = f"не JSON (HTTP {status}, {ctype}): {snippet!r}"
+                last_err = f"не JSON (HTTP {status}, {ctype}, {len(raw)} байт, {hdrs}): {snippet!r}"
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 429):
                 raise RuntimeError(f"HTTP {e.code} (можливе блокування)") from None
@@ -145,13 +163,13 @@ def check_event(ev, st, token, chat_id, now):
     page_url = f"{BASE}/Stadium/Index?eventId={eid}"
     info_url = f"{BASE}/Stadium/GetWGLSectorsInfo?eventId={eid}"
     sectors_url = f"{BASE}/Stadium/GetWGLSectors?eventId={eid}"
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
-    )
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
  
     try:
         try:
-            fetch(opener, page_url, as_json=False)  # cookies, як у браузера
+            page = fetch(opener, page_url, as_json=False)  # cookies, як у браузера
+            print(f"[{eid}] сторінка: {len(page)} символів; cookies: {[c.name for c in jar]}")
         except Exception as e:
             print(f"[{eid}] сторінка події (cookies): {e}")
         info = fetch(opener, info_url, referer=page_url)
