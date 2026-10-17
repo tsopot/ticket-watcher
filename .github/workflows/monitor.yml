@@ -23,8 +23,9 @@ concurrency:
  
 jobs:
   check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
+    # Зафіксовано версію ОС, бо ubuntu-latest переходить на Ubuntu 26 (19.10.2026)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
  
@@ -35,6 +36,22 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: |
             state-
+ 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+ 
+      - name: Install Playwright (pinned)
+        run: pip install "playwright==1.62.0"
+ 
+      # Кеш браузера, щоб не завантажувати Chromium щоразу
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-1.62.0-${{ runner.os }}-chromium
+ 
+      - name: Install Chromium
+        run: playwright install --with-deps chromium
  
       - name: Run monitor
         env:
