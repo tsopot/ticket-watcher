@@ -1,6 +1,7 @@
 name: Ticket monitor
- 
+
 on:
+  # Резервний розклад (основний таймер - cron-job.org, раз на 5 хвилин через workflow_dispatch)
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
@@ -13,22 +14,26 @@ on:
         description: "Разова перевірка іншого eventId (порожньо = усі матчі з events.json)"
         type: string
         default: ""
- 
+      checks:
+        description: "Скільки перевірок у цьому запуску (за замовчуванням 5, раз на хвилину)"
+        type: string
+        default: "5"
+
 permissions:
   contents: read
- 
+
 concurrency:
   group: ticket-monitor
   cancel-in-progress: false
- 
+
 jobs:
   check:
     # Зафіксовано версію ОС, бо ubuntu-latest переходить на Ubuntu 26 (19.10.2026)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
- 
+
       # Зберігає state між запусками (щоб не спамити однаковими сповіщеннями)
       - uses: actions/cache@v4
         with:
@@ -36,28 +41,28 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: |
             state-
- 
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
- 
+
       - name: Install Playwright (pinned)
         run: pip install "playwright==1.62.0"
- 
+
       # Кеш браузера, щоб не завантажувати Chromium щоразу
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-1.62.0-${{ runner.os }}-chromium
- 
+
       - name: Install Chromium
         run: playwright install --with-deps chromium
- 
+
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_MODE: ${{ inputs.test && '1' || '0' }}
           EVENT_ID: ${{ inputs.event_id }}
+          LOOP_CHECKS: ${{ inputs.checks || '5' }}
         run: python3 monitor.py
- 
